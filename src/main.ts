@@ -1,16 +1,12 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFolder } from 'obsidian';
+import { App, Editor, MarkdownView, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
 
-// 1. Интерфейс настроек
+// 1. Настройки плагина
 interface ChatFormatterSettings {
     targetFolder: string;
-    userMarkers: string;
-    aiMarkers: string;
 }
 
 const DEFAULT_SETTINGS: ChatFormatterSettings = {
-    targetFolder: "Ответы ИИ",
-    userMarkers: "You, Вы сказали, User:, Вопрос, Вопрос:, )))",
-    aiMarkers: "Gemini, ChatGPT сказал, Assistant:, AI:, Ответ ИИ, Ответ ИИ:, ((("
+    targetFolder: "Ответы ИИ"
 }
 
 export default class ChatFormatterPlugin extends Plugin {
@@ -22,24 +18,47 @@ export default class ChatFormatterPlugin extends Plugin {
         // Добавляем вкладку настроек
         this.addSettingTab(new ChatFormatterSettingTab(this.app, this));
 
-        // 2. Регистрируем команду (появится в палитре и можно назначить Hotkey)
+        // СПОСОБ 1: Команда (для вызова через Ctrl+P и назначения Горячих клавиш)
         this.addCommand({
-            id: 'format-ai-chat-callouts',
-            name: 'Оформить чат с ИИ (Callouts)',
-            // editorCallback гарантирует, что команда сработает только если открыт редактор
+            id: 'format-nested-callouts',
+            name: 'Оформить вложенные Callout-блоки',
             editorCallback: async (editor: Editor, view: MarkdownView) => {
                 await this.formatChat(editor, view);
             }
         });
+
+        // СПОСОБ 2: Пункт в контекстном меню (правый клик мышью по тексту)
+        this.registerEvent(
+            this.app.workspace.on('editor-menu', (menu, editor, view) => {
+                menu.addItem((item) => {
+                    item
+                        .setTitle('Оформить Callout-блоки')
+                        .setIcon('list-tree') // Иконка древовидного списка
+                        .onClick(() => {
+                            this.formatChat(editor, view);
+                        });
+                });
+            })
+        );
+
+        // СПОСОБ 3: Иконка на левой боковой панели (Ribbon)
+        this.addRibbonIcon('layers', 'Оформить вложенные Callout-блоки', (evt: MouseEvent) => {
+            const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+            if (view && view.editor) {
+                this.formatChat(view.editor, view);
+            } else {
+                new Notice('Пожалуйста, откройте заметку для форматирования!');
+            }
+        });
     }
 
-    // 3. Основная логика (твоя адаптация из Templater)
+    // Основная логика обработки текста
     async formatChat(editor: Editor, view: MarkdownView) {
         const fullContent = editor.getValue();
         let yaml = "";
         let chatBody = fullContent;
 
-        // Изолируем YAML
+        // Изолируем YAML-фронтматтер, чтобы не сломать свойства заметки
         if (fullContent.trimStart().startsWith("---")) {
             const parts = fullContent.split(/^---/m);
             if (parts.length >= 3) {
@@ -48,73 +67,46 @@ export default class ChatFormatterPlugin extends Plugin {
             }
         }
 
-        // Получаем маркеры из настроек и очищаем их от пробелов
-        const userMarkers = this.settings.userMarkers.split(',').map(s => s.trim()).filter(s => s.length > 0);
-        const aiMarkers = this.settings.aiMarkers.split(',').map(s => s.trim()).filter(s => s.length > 0);
-
         const lines = chatBody.split("\n");
-        let blocks = [];
-        let currentRole: "user" | "ai" | null = null;
-        let currentText: string[] = [];
-
-        // Парсим текст
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i].trim();
-            const isUser = userMarkers.some(m => line.startsWith(m));
-            const isAi = aiMarkers.some(m => line.startsWith(m));
-
-            if (isUser || isAi) {
-                if (currentRole && currentText.length > 0) {
-                    blocks.push({ role: currentRole, content: currentText.join("\n").trim() });
-                }
-                currentRole = isUser ? "user" : "ai";
-                currentText = [];
-                continue;
-            }
-
-            if (currentRole) {
-                currentText.push(lines[i]);
-            } else if (line !== "") {
-                currentRole = "user";
-                currentText.push(lines[i]);
-            }
-        }
-
-        if (currentRole && currentText.length > 0) {
-            blocks.push({ role: currentRole, content: currentText.join("\n").trim() });
-        }
-
-        // Формирование Markdown (Callouts)
         let finalOutputLines = [];
-        for (let block of blocks) {
-            if (block.role === "user") {
-                finalOutputLines.push("> [!question] Вопрос");
-                finalOutputLines.push("> " + block.content.replace(/\n/g, "\n> "));
-                finalOutputLines.push("");
-            } else {
-                finalOutputLines.push("> [!abstract]- Ответ ИИ");
-                const aiLines = block.content.split("\n");
-                let inCodeBlock = false;
+        let depth = 0; // Отслеживаем уровень вложенности
 
-                for (let line of aiLines) {
-                    if (line.trim().startsWith("```")) {
-                        if (!inCodeBlock) {
-                            finalOutputLines.push("> > [!example]- Код");
-                            finalOutputLines.push("> > " + line);
-                            inCodeBlock = true;
-                        } else {
-                            finalOutputLines.push("> > " + line);
-                            inCodeBlock = false;
-                        }
-                    } else {
-                        finalOutputLines.push(inCodeBlock ? "> > " + line : "> " + line);
-                    }
+        // Построчный парсинг
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const trimmed = line.trim();
+
+            // Если встретили НАЧАЛО блока
+            if (trimmed.startsWith("(((")) {
+                let title = trimmed.substring(3).trim();
+                if (!title) title = "Вложенный блок";
+                
+                let prefix = "> ".repeat(depth);
+                finalOutputLines.push(`${prefix}> [!note] ${title}`);
+                depth++;
+            } 
+            // Если встретили КОНЕЦ блока
+            else if (trimmed.startsWith(")))")) {
+                if (depth > 0) {
+                    depth--;
                 }
-                finalOutputLines.push("\n---");
+            } 
+            // Обычный текст
+            else {
+                if (depth > 0) {
+                    let prefix = "> ".repeat(depth);
+                    if (trimmed === "") {
+                        finalOutputLines.push(prefix.trimEnd());
+                    } else {
+                        finalOutputLines.push(`${prefix}${line}`);
+                    }
+                } else {
+                    finalOutputLines.push(line);
+                }
             }
         }
 
-        // Применяем изменения и перемещаем файл
+        // Применяем изменения
         if (finalOutputLines.length > 0) {
             const finalOutput = yaml + finalOutputLines.join("\n");
             editor.setValue(finalOutput);
@@ -123,25 +115,28 @@ export default class ChatFormatterPlugin extends Plugin {
             if (!currentFile) return;
 
             const targetFolder = this.settings.targetFolder.trim();
-            const newPath = `${targetFolder}/${currentFile.name}`;
-
-            if (currentFile.path !== newPath && targetFolder !== "") {
-                try {
-                    let folder = this.app.vault.getAbstractFileByPath(targetFolder);
-                    if (!folder) {
-                        await this.app.vault.createFolder(targetFolder);
+            
+            // Если папка для сохранения указана, перемещаем файл
+            if (targetFolder !== "") {
+                const newPath = `${targetFolder}/${currentFile.name}`;
+                if (currentFile.path !== newPath) {
+                    try {
+                        let folder = this.app.vault.getAbstractFileByPath(targetFolder);
+                        if (!folder) {
+                            await this.app.vault.createFolder(targetFolder);
+                        }
+                        await this.app.fileManager.renameFile(currentFile, newPath);
+                        new Notice(`Готово! Оформлено и перемещено в «${targetFolder}».`);
+                    } catch (err) {
+                        console.error(err);
+                        new Notice("Оформлено, но перенести файл не удалось.");
                     }
-                    await this.app.fileManager.renameFile(currentFile, newPath);
-                    new Notice(`Готово! Чат оформлен и перемещён в «${targetFolder}».`);
-                } catch (err) {
-                    console.error(err);
-                    new Notice("Чат оформлен, но перенести файл не удалось (возможно, файл с таким именем уже есть).");
+                } else {
+                    new Notice("Готово! Вложенные блоки оформлены.");
                 }
             } else {
-                new Notice("Готово! Чат оформлен.");
+                new Notice("Готово! Вложенные блоки оформлены.");
             }
-        } else {
-            new Notice("Не удалось найти маркеры диалога. Проверьте текст.");
         }
     }
 
@@ -154,7 +149,7 @@ export default class ChatFormatterPlugin extends Plugin {
     }
 }
 
-// 4. Окно настроек плагина
+// Интерфейс окна настроек
 class ChatFormatterSettingTab extends PluginSettingTab {
     plugin: ChatFormatterPlugin;
 
@@ -170,34 +165,12 @@ class ChatFormatterSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Папка для сохранения')
-            .setDesc('Куда перемещать отформатированные файлы (оставьте пустым, чтобы не перемещать)')
+            .setDesc('Куда автоматически перемещать отформатированные файлы (оставьте пустым, чтобы файл оставался на месте)')
             .addText(text => text
                 .setPlaceholder('Ответы ИИ')
                 .setValue(this.plugin.settings.targetFolder)
                 .onChange(async (value) => {
                     this.plugin.settings.targetFolder = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('Маркеры пользователя')
-            .setDesc('Слова, с которых начинается ваш вопрос (через запятую)')
-            .addTextArea(text => text
-                .setPlaceholder('You, Вы сказали, User:')
-                .setValue(this.plugin.settings.userMarkers)
-                .onChange(async (value) => {
-                    this.plugin.settings.userMarkers = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('Маркеры ИИ')
-            .setDesc('Слова, с которых начинается ответ нейросети (через запятую)')
-            .addTextArea(text => text
-                .setPlaceholder('Gemini, ChatGPT сказал, Assistant:')
-                .setValue(this.plugin.settings.aiMarkers)
-                .onChange(async (value) => {
-                    this.plugin.settings.aiMarkers = value;
                     await this.plugin.saveSettings();
                 }));
     }
