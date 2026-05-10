@@ -1,12 +1,16 @@
 import { App, Editor, MarkdownView, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
 
-// 1. Настройки плагина
+// Интерфейс настроек
 interface ChatFormatterSettings {
     targetFolder: string;
+    startMarker: string;
+    endMarker: string;
 }
 
 const DEFAULT_SETTINGS: ChatFormatterSettings = {
-    targetFolder: "Ответы ИИ"
+    targetFolder: "Ответы ИИ",
+    startMarker: "(((",
+    endMarker: ")))"
 }
 
 export default class ChatFormatterPlugin extends Plugin {
@@ -14,26 +18,22 @@ export default class ChatFormatterPlugin extends Plugin {
 
     async onload() {
         await this.loadSettings();
-
-        // Добавляем вкладку настроек
         this.addSettingTab(new ChatFormatterSettingTab(this.app, this));
 
-        // СПОСОБ 1: Команда (для вызова через Ctrl+P и назначения Горячих клавиш)
         this.addCommand({
-            id: 'format-nested-callouts',
-            name: 'Оформить вложенные Callout-блоки',
+            id: 'format-nested-callouts-copy',
+            name: 'Оформить (создать копию)',
             editorCallback: async (editor: Editor, view: MarkdownView) => {
                 await this.formatChat(editor, view);
             }
         });
 
-        // СПОСОБ 2: Пункт в контекстном меню (правый клик мышью по тексту)
         this.registerEvent(
             this.app.workspace.on('editor-menu', (menu, editor, view) => {
                 menu.addItem((item) => {
                     item
-                        .setTitle('Оформить Callout-блоки')
-                        .setIcon('list-tree') // Иконка древовидного списка
+                        .setTitle('Оформить (копия)')
+                        .setIcon('help-circle')
                         .onClick(() => {
                             this.formatChat(editor, view);
                         });
@@ -41,102 +41,122 @@ export default class ChatFormatterPlugin extends Plugin {
             })
         );
 
-        // СПОСОБ 3: Иконка на левой боковой панели (Ribbon)
-        this.addRibbonIcon('layers', 'Оформить вложенные Callout-блоки', (evt: MouseEvent) => {
+        this.addRibbonIcon('help-circle', 'Оформить (копия)', (evt: MouseEvent) => {
             const view = this.app.workspace.getActiveViewOfType(MarkdownView);
             if (view && view.editor) {
                 this.formatChat(view.editor, view);
             } else {
-                new Notice('Пожалуйста, откройте заметку для форматирования!');
+                new Notice('Пожалуйста, откройте заметку!');
             }
         });
     }
 
-    // Основная логика обработки текста
     async formatChat(editor: Editor, view: MarkdownView) {
+        const currentFile = view.file;
+        if (!currentFile) return;
+
+        const targetFolder = this.settings.targetFolder.trim();
+        if (!targetFolder) {
+            new Notice("Укажите папку в настройках!");
+            return;
+        }
+
         const fullContent = editor.getValue();
         let yaml = "";
         let chatBody = fullContent;
 
-        // Изолируем YAML-фронтматтер, чтобы не сломать свойства заметки
         if (fullContent.trimStart().startsWith("---")) {
             const parts = fullContent.split(/^---/m);
             if (parts.length >= 3) {
-                yaml = `---${parts[1]}---\n\n`;
+                yaml = `---${parts[1]}---\n`;
                 chatBody = parts.slice(2).join("---").trim();
             }
         }
 
-        const lines = chatBody.split("\n");
-        let finalOutputLines = [];
-        let depth = 0; // Отслеживаем уровень вложенности
+        const startM = this.settings.startMarker.trim();
+        const endM = this.settings.endMarker.trim();
 
-        // Построчный парсинг
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            const trimmed = line.trim();
+        // Препроцессор для изоляции маркеров
+        let safeBody = chatBody.split(startM).join(`\n${startM}\n`);
+        safeBody = safeBody.split(endM).join(`\n${endM}\n`);
 
-            // Если встретили НАЧАЛО блока
-            if (trimmed.startsWith("(((")) {
-                let title = trimmed.substring(3).trim();
-                if (!title) title = "Вложенный блок";
-                
-                let prefix = "> ".repeat(depth);
-                finalOutputLines.push(`${prefix}> [!note] ${title}`);
+        const rawLines = safeBody.split(/\r?\n/);
+        let finalOutputLines: string[] = [];
+        let depth = 0;
+        let needsTitle = false;
+
+        for (let i = 0; i < rawLines.length; i++) {
+            let line = rawLines[i];
+            let trimmed = line.trim();
+
+            if (!trimmed) {
+                if (depth > 0) finalOutputLines.push("> ".repeat(depth).trimEnd());
+                else finalOutputLines.push("");
+                continue;
+            }
+
+            if (trimmed === startM) {
                 depth++;
+                needsTitle = true;
+                continue;
             } 
-            // Если встретили КОНЕЦ блока
-            else if (trimmed.startsWith(")))")) {
-                if (depth > 0) {
-                    depth--;
-                }
-            } 
-            // Обычный текст
-            else {
-                if (depth > 0) {
-                    let prefix = "> ".repeat(depth);
-                    if (trimmed === "") {
-                        finalOutputLines.push(prefix.trimEnd());
-                    } else {
-                        finalOutputLines.push(`${prefix}${line}`);
+            else if (trimmed === endM) {
+                if (depth > 0) depth--;
+                continue;
+            }
+
+            let prefix = "> ".repeat(depth);
+            
+            if (needsTitle) {
+                let title = "";
+                let body = "";
+                
+                // Умный поиск заголовка в склеенной строке
+                let splitIndex = -1;
+                for (let j = 1; j < trimmed.length; j++) {
+                    if (trimmed[j] !== ' ' && trimmed[j] === trimmed[j].toUpperCase() && trimmed[j].match(/[А-ЯЁA-Z]/)) {
+                        if (trimmed[j-1] === ' ') {
+                            splitIndex = j;
+                            break;
+                        }
                     }
-                } else {
-                    finalOutputLines.push(line);
                 }
+
+                if (splitIndex !== -1 && splitIndex < 60) {
+                    title = trimmed.substring(0, splitIndex).trim();
+                    body = trimmed.substring(splitIndex).trim();
+                } else {
+                    title = trimmed.length < 60 ? trimmed : "Вопрос";
+                    if (trimmed.length >= 60) body = trimmed;
+                }
+
+                // [!question]- делает блок оранжевым и свернутым
+                finalOutputLines.push(`${prefix.slice(0, -2)}> [!question]- Ответ: ${title}`);
+                if (body) finalOutputLines.push(`${prefix}${body}`);
+                needsTitle = false;
+            } else {
+                finalOutputLines.push(`${prefix}${line}`);
             }
         }
 
-        // Применяем изменения
-        if (finalOutputLines.length > 0) {
-            const finalOutput = yaml + finalOutputLines.join("\n");
-            editor.setValue(finalOutput);
+        const finalOutput = yaml + (yaml ? "\n" : "") + finalOutputLines.join("\n");
 
-            const currentFile = view.file;
-            if (!currentFile) return;
+        try {
+            let folder = this.app.vault.getAbstractFileByPath(targetFolder);
+            if (!folder) await this.app.vault.createFolder(targetFolder);
 
-            const targetFolder = this.settings.targetFolder.trim();
-            
-            // Если папка для сохранения указана, перемещаем файл
-            if (targetFolder !== "") {
-                const newPath = `${targetFolder}/${currentFile.name}`;
-                if (currentFile.path !== newPath) {
-                    try {
-                        let folder = this.app.vault.getAbstractFileByPath(targetFolder);
-                        if (!folder) {
-                            await this.app.vault.createFolder(targetFolder);
-                        }
-                        await this.app.fileManager.renameFile(currentFile, newPath);
-                        new Notice(`Готово! Оформлено и перемещено в «${targetFolder}».`);
-                    } catch (err) {
-                        console.error(err);
-                        new Notice("Оформлено, но перенести файл не удалось.");
-                    }
-                } else {
-                    new Notice("Готово! Вложенные блоки оформлены.");
-                }
-            } else {
-                new Notice("Готово! Вложенные блоки оформлены.");
+            let newPath = `${targetFolder}/${currentFile.basename}_formatted.${currentFile.extension}`;
+            let counter = 1;
+            while (this.app.vault.getAbstractFileByPath(newPath)) {
+                newPath = `${targetFolder}/${currentFile.basename}_formatted_${counter}.${currentFile.extension}`;
+                counter++;
             }
+
+            await this.app.vault.create(newPath, finalOutput);
+            new Notice(`Готово! Оранжевые блоки созданы в: ${newPath}`);
+        } catch (err) {
+            console.error(err);
+            new Notice("Ошибка сохранения!");
         }
     }
 
@@ -149,7 +169,6 @@ export default class ChatFormatterPlugin extends Plugin {
     }
 }
 
-// Интерфейс окна настроек
 class ChatFormatterSettingTab extends PluginSettingTab {
     plugin: ChatFormatterPlugin;
 
@@ -165,12 +184,28 @@ class ChatFormatterSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Папка для сохранения')
-            .setDesc('Куда автоматически перемещать отформатированные файлы (оставьте пустым, чтобы файл оставался на месте)')
             .addText(text => text
-                .setPlaceholder('Ответы ИИ')
                 .setValue(this.plugin.settings.targetFolder)
                 .onChange(async (value) => {
                     this.plugin.settings.targetFolder = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Маркер начала')
+            .addText(text => text
+                .setValue(this.plugin.settings.startMarker)
+                .onChange(async (value) => {
+                    this.plugin.settings.startMarker = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Маркер конца')
+            .addText(text => text
+                .setValue(this.plugin.settings.endMarker)
+                .onChange(async (value) => {
+                    this.plugin.settings.endMarker = value;
                     await this.plugin.saveSettings();
                 }));
     }
